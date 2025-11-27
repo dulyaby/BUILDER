@@ -1,0 +1,308 @@
+import os
+import streamlit as st
+from google import genai
+from google.genai import types 
+from io import BytesIO
+import urllib.parse 
+import time
+import mimetypes 
+import base64 # Tumia Base64 kwa encoding salama ya Prompt kwenye URL
+
+# ----------------- CONFIGURATION & INITIALIZATION -----------------
+st.set_page_config(page_title="Jukwaa la Ujenzi wa AI", layout="wide")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") 
+
+if not GEMINI_API_KEY:
+    st.error("🚨 GEMINI_API_KEY haipatikani kwenye Environment Variables. Tafadhali weka 'GEMINI_API_KEY'.")
+    st.stop()
+    
+try:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+except Exception as e:
+    st.error(f"🚨 Imeshindwa kuunganisha Gemini Client: {e}")
+    st.stop()
+
+# ----------------- PROMPTS ZILIZOHIFADHIWA -----------------
+# Prompt hii inatumika kumwomba Gemini azalishe Final System Prompt kutokana na faili.
+PROMPT_GENERATION_INSTRUCTION = (
+    "Chambua kwa kina taarifa muhimu za biashara hii kutoka kwenye faili lililopakuliwa. "
+    "Kisha, kwa kutumia taarifa hizo na kufuata muundo huu, **tengeneza System Prompt kamili** (Final AI Prompt) "
+    "ambayo inaweza kutumiwa moja kwa moja kuendesha AI ya Huduma kwa Wateja. "
+    "Prompt hiyo inapaswa kuwa fupi, kali, na ieleze JINA LA BIASHARA, ROLE YA AI, SHERIA (Rules), na MWELEKEO WA MAZUNGUMZO. "
+    "Anza jibu lako na prompt hiyo kamili, bila maelezo mengine ya ziada."
+)
+
+DEFAULT_PROMPT_TEMPLATE = """
+Wewe ni Msaidizi wa Wateja wa BIASHARA YAKO (mfano: NMB). Jukumu lako ni kutoa huduma kwa wateja.
+
+### SHERIA ZA MSINGI:
+1. Jibu KWA KUTUMIA PEKEE TAARIFA ZILIZOMO KWENYE 'NYARAKA ZA BIASHARA' zilizo hapa chini.
+2. Ikiwa taarifa haipo, sema kwa adabu, 'Samahani, taarifa hiyo haipatikani kwenye vyanzo vyangu.'
+3. Jibu kwa Kiswahili fasaha.
+
+### NYARAKA ZA BIASHARA (Zilizotolewa kutoka kwenye faili):
+[Hapa ndipo taarifa zako zote za biashara zilizo kwenye PDF zitabandikwa baada ya uchambuzi wa AI]
+"""
+# ----------------- HELPER FUNCTIONS (Zilizoimarishwa) -----------------
+
+def upload_file_to_gemini(uploaded_file):
+    """Hupakia faili kwenye Gemini File API na kurejesha File Object."""
+    st.info(f"⚡ Inapakia faili '{uploaded_file.name}' kwa ajili ya kuchambuliwa. Tafadhali subiri...")
+    try:
+        uploaded_file.seek(0)
+        file_bytes = uploaded_file.read()
+
+        mime_type, _ = mimetypes.guess_type(uploaded_file.name)
+        if mime_type is None:
+             if uploaded_file.name.lower().endswith(('.txt', '.docx')):
+                 mime_type = 'text/plain' 
+             else:
+                raise ValueError("Could not determine file type. Please try PDF, DOCX, or TXT.")
+
+        for _ in range(3):
+            try:
+                gemini_file = client.files.upload(
+                    file=BytesIO(file_bytes),
+                    mime_type=mime_type 
+                )
+                return gemini_file
+            except Exception as e:
+                time.sleep(1) 
+                if _ == 2:
+                    raise e
+                    
+    except Exception as e:
+        st.error(f"🚨 Kosa la Kupakia Faili: {e}")
+        return None
+
+def generate_final_ai_prompt(gemini_file):
+    """Huzalisha Prompt ya mwisho ya AI kwa kutumia PDF iliyopakuliwa kwa msaada wa Gemini."""
+    st.info("⚡ Inachambua faili na kuzalisha System Prompt yako ya mwisho. Hii inaweza kuchukua muda...")
+    
+    # Huu ndio muundo wa RAG (Retrieval Augmented Generation)
+    text_part = types.Part(text=PROMPT_GENERATION_INSTRUCTION)
+    
+    analysis_content = [
+        types.Content(role="user", parts=[
+            text_part,
+            gemini_file # Faili linatumika kama muktadha wa Prompt Generation
+        ])
+    ]
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', 
+            contents=analysis_content
+        )
+        
+        if response.text:
+            return response.text
+        else:
+            # Ikiwa jibu ni tupu, tumia template ya mfano
+            st.warning("⚠️ AI haikuzalisha Prompt kamili. Inatumia Prompt ya mfano, tafadhali irekebishe mwenyewe.")
+            return DEFAULT_PROMPT_TEMPLATE
+            
+    except Exception as e:
+        st.error(f"Kosa la Kuzalisha Final Prompt: {e}")
+        return DEFAULT_PROMPT_TEMPLATE # Rudi kwenye default template
+        
+def get_gemini_response_final_ai(prompt, history):
+    """Hutuma ombi la chat kwa AI iliyoundwa (Final AI Mode)"""
+    
+    config = types.GenerateContentConfig(
+        system_instruction=prompt
+    )
+    
+    contents = []
+    for role, text in history:
+        gemini_role = 'user' if role == 'user' else 'model'
+        contents.append(
+            types.Content(role=gemini_role, parts=[types.Part(text=text)])
+        )
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=contents,
+            config=config
+        )
+        return response.text
+    except Exception as e:
+        # Kosa linatolewa kwa mtumiaji
+        return f"Samahani, AI imeshindwa kujibu swali hili kutokana na kosa la mawasiliano: {e}"
+
+# ----------------- STATE MANAGEMENT -----------------
+# State 1: Upload File
+# State 2: Generate Prompt (Hidden)
+# State 3: Display Prompt and Link
+# State 4: Final AI Mode (triggered by URL)
+
+if 'app_state' not in st.session_state: st.session_state.app_state = 1
+if 'chat_history' not in st.session_state: st.session_state.chat_history = []
+if 'gemini_file' not in st.session_state: st.session_state.gemini_file = None
+if 'final_system_prompt' not in st.session_state: st.session_state.final_system_prompt = None
+if 'file_display_name' not in st.session_state: st.session_state.file_display_name = None 
+if 'ai_name' not in st.session_state: st.session_state.ai_name = "AI ya Biashara"
+
+
+# ----------------- URL HANDLER (FINAL AI MODE) -----------------
+query_params = st.query_params
+
+if 'mode' in query_params and query_params['mode'] == 'final_ai':
+    st.session_state.app_state = 4
+    
+    # Decode Prompt na Jina la AI kutoka URL (Base64)
+    try:
+        encoded_prompt = query_params['prompt'][0]
+        final_prompt = base64.b64decode(encoded_prompt.encode('utf-8')).decode('utf-8')
+    except:
+        final_prompt = "Wewe ni Msaidizi wa Wateja. Samahani, nimeshindwa kupata System Prompt yako. Tafadhali jaribu tena."
+        st.error("🚨 Kosa la Decoding: Prompt imeshindwa kusomwa kutoka kwenye linki.")
+
+    ai_name = query_params.get('name', ["AI ya Biashara"])[0]
+    
+    st.title(f"🤖 AI Yako Iliyoundwa: {ai_name}")
+    st.markdown("---")
+
+    # Initialization ya Chat kwa Hali ya Mwisho
+    if 'final_ai_chat_history' not in st.session_state:
+        st.session_state.final_ai_chat_history = []
+        st.session_state.final_ai_chat_history.append(("assistant", f"Karibu! Mimi ni **{ai_name}**, niko tayari kukuhudumia. Unaweza kuuliza swali lolote kuhusu huduma zetu."))
+        
+    st.session_state.chat_history = st.session_state.final_ai_chat_history
+
+    # Onyesha Historia ya Chat
+    for role, text in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.markdown(text)
+
+    # Input ya Chat
+    user_prompt = st.chat_input("Tuma ujumbe kwa AI yako...")
+    
+    if user_prompt:
+        
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+        
+        st.session_state.final_ai_chat_history.append(("user", user_prompt))
+        
+        with st.spinner("AI inajibu..."):
+            
+            response_text = get_gemini_response_final_ai(
+                final_prompt,
+                st.session_state.final_ai_chat_history
+            )
+            
+            with st.chat_message("assistant"):
+                st.markdown(response_text)
+            
+            st.session_state.final_ai_chat_history.append(("assistant", response_text))
+            
+    st.stop() # Maliza hapa, tusirudi kwenye Builder UI
+
+
+# ----------------- BUILDER UI (STATES 1, 2, 3) -----------------
+
+st.title("✨ Jukwaa la Kuunda AI: Hatua 3 Tu")
+st.subheader("Pakia nyaraka, AI itazalisha System Prompt, kisha utapata Linki ya AI yako.")
+
+
+# --- STATE 1: UPLOAD FILE ---
+if st.session_state.app_state == 1:
+    st.markdown("---")
+    st.header("1. Pakia Nyaraka za Biashara (PDF/TXT/DOCX)")
+    
+    uploaded_file = st.file_uploader(
+        "Pakia faili lenye maelezo ya kina ya biashara yako:", 
+        type=["pdf", "txt", "docx", "pptx"],
+        accept_multiple_files=False,
+        key="file_uploader_key"
+    )
+
+    MAX_FILE_SIZE_MB = 90  
+    
+    if uploaded_file is not None and st.session_state.gemini_file is None:
+        file_size_mb = uploaded_file.size / (1024 * 1024)
+        
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            st.error(f"🚨 Kosa: Ukubwa wa faili ({file_size_mb:.2f} MB) unazidi ukomo unaokubalika wa {MAX_FILE_SIZE_MB} MB. Tafadhali pakia faili dogo.")
+            st.stop()
+        
+        # Endelea kupakia faili
+        st.session_state.gemini_file = upload_file_to_gemini(uploaded_file)
+        
+        if st.session_state.gemini_file:
+            st.session_state.file_display_name = uploaded_file.name 
+            st.session_state.app_state = 2 # Nenda Hatua ya Kuzalisha Prompt
+            st.rerun() 
+            
+# --- STATE 2: GENERATE PROMPT (Automatic) ---
+elif st.session_state.app_state == 2:
+    st.markdown("---")
+    st.header("2. AI Inazalisha System Prompt...")
+    st.info(f"Faili **{st.session_state.file_display_name}** linachambuliwa sasa...")
+    
+    # Piga simu ya Gemini kuzalisha Prompt
+    final_prompt = generate_final_ai_prompt(st.session_state.gemini_file)
+    st.session_state.final_system_prompt = final_prompt
+
+    st.session_state.app_state = 3 # Nenda Hatua ya Kuonyesha Linki
+    st.rerun() 
+
+# --- STATE 3: DISPLAY LINK ---
+elif st.session_state.app_state == 3:
+    st.markdown("---")
+    st.header("3. AI Yako Imeundwa na Iko Tayari!")
+    
+    st.success("✅ System Prompt imezalishwa kwa mafanikio!")
+    
+    # ------------------- KUTENGENEZA LINK -------------------
+    
+    st.session_state.ai_name = st.text_input(
+        "Jina la AI Yako (Kama linavyoonekana kwa Wateja):",
+        value=st.session_state.ai_name
+    )
+
+    # Encode Prompt kwa ajili ya URL (Base64)
+    encoded_prompt = base64.b64encode(st.session_state.final_system_prompt.encode('utf-8')).decode('utf-8')
+    
+    # Jaribu kupata URL ya sasa (Muhimu kwa Render/Deployment)
+    try:
+        # Hii inahitaji st.experimental_get_query_params() kufanya kazi
+        base_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}" 
+        if not base_url or "None" in base_url:
+            # Kutumia mbinu ya fallback
+            base_url = st.experimental_get_query_params().keys().__next__() if st.experimental_get_query_params() else "http://localhost:8501"
+            base_url = base_url.split('?')[0]
+    except Exception:
+        base_url = "http://localhost:8501" 
+        
+    ai_link = base_url + "?" + urllib.parse.urlencode({
+        'mode': 'final_ai', 
+        'prompt': encoded_prompt,
+        'name': st.session_state.ai_name
+    })
+
+    st.markdown(f"""
+    ## **LINKI YA AI YAKO HII HAPA:**
+    
+    AI yako iitwayo **{st.session_state.ai_name}** iko tayari kuhudumia wateja kwa kutumia nyaraka ulizopakia.
+    
+    **Bonyeza linki hii ili kuanza kutumia AI yako:**
+    ### **[{st.session_state.ai_name} - Chat Now]({ai_link})**
+    
+    """)
+    
+    # Muwezeshe mfanyabiashara kuona na kurekebisha Prompt iliyozalishwa
+    with st.expander("Ona na Rekebisha System Prompt Iliyozalishwa (Optional)"):
+        st.session_state.final_system_prompt = st.text_area(
+            "System Prompt Hii ndiyo Inayoongoza AI Yako:",
+            value=st.session_state.final_system_prompt,
+            height=400
+        )
+        st.warning("Kama umefanya marekebisho, bonyeza 'Zalisha Linki Mpya' hapo chini ili kuunda linki mpya.")
+        
+        if st.button("Zalisha Linki Mpya"):
+            st.success("Linki mpya itatengenezwa katika mzunguko unaofuata.")
+            st.rerun()
